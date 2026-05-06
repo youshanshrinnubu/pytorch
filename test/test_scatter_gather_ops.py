@@ -8,7 +8,7 @@ from torch.testing import make_tensor
 from torch.testing._internal.common_utils import \
     (parametrize, run_tests, TestCase, DeterministicGuard, TEST_WITH_ROCM, serialTest)
 from torch.testing._internal.common_device_type import \
-    (instantiate_device_type_tests, onlyCPU, dtypes, dtypesIfCUDA,
+    (instantiate_device_type_tests, onlyCPU, onlyCUDA, dtypes, dtypesIfCUDA,
      toleranceOverride, tol,)
 from torch.testing._internal.common_dtype import \
     (get_all_dtypes,)
@@ -280,6 +280,7 @@ class TestScatterGather(TestCase):
                 self.assertEqual(res0[0, :], m * torch.ones(n, device=device, dtype=dtype), atol=0, rtol=0)
                 self.assertEqual(res1[:, 0], n * torch.ones(m, device=device, dtype=dtype), atol=0, rtol=0)
 
+    @onlyCUDA
     @dtypes(torch.float32, torch.float64, torch.half, torch.bfloat16)
     def test_scatter_add_large(self, device, dtype):
         # test larger shapes that exercise the vectorized/TMA scatter_add path
