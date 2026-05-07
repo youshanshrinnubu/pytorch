@@ -1,196 +1,104 @@
-ARG UBUNTU_VERSION
+# Ubuntu-based Docker image for PyTorch CI builds
+# Supports multiple Ubuntu versions via build args
 
-FROM ubuntu:${UBUNTU_VERSION} as base
+ARG UBUNTU_VERSION=20.04
+FROM ubuntu:${UBUNTU_VERSION}
 
-ARG UBUNTU_VERSION
+ARG UBUNTU_VERSION=20.04
+ARG CUDA_VERSION=""
+ARG CUDNN_VERSION=""
+ARG PYTHON_VERSION=3.8
+ARG CMAKE_VERSION=3.22.1
+ARG GCC_VERSION=9
 
-ENV DEBIAN_FRONTEND noninteractive
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=America/Los_Angeles
 
-ARG CLANG_VERSION
+# Install base system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    apt-transport-https \
+    ca-certificates \
+    curl \
+    gnupg \
+    gnupg2 \
+    software-properties-common \
+    wget \
+    && rm -rf /var/lib/apt/lists/*
 
-# Allow APT to run as root
-RUN echo 'APT::Sandbox::User "root";' | tee -a /etc/apt/apt.conf.d/10sandbox
+# Install build tools and development libraries
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    gcc-${GCC_VERSION} \
+    g++-${GCC_VERSION} \
+    git \
+    libssl-dev \
+    libffi-dev \
+    libopenblas-dev \
+    libblas-dev \
+    liblapack-dev \
+    libgflags-dev \
+    libgtest-dev \
+    libprotobuf-dev \
+    protobuf-compiler \
+    ninja-build \
+    pkg-config \
+    unzip \
+    vim \
+    zip \
+    zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
 
-# Install common dependencies (so that this step can be cached separately)
-COPY ./common/install_base.sh install_base.sh
-RUN bash ./install_base.sh && rm install_base.sh
+# Set GCC alternatives
+RUN update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-${GCC_VERSION} 100 \
+    && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-${GCC_VERSION} 100
 
-# Install clang
-ARG LLVMDEV
-COPY ./common/install_clang.sh install_clang.sh
-RUN bash ./install_clang.sh && rm install_clang.sh
+# Install Python
+RUN add-apt-repository ppa:deadsnakes/ppa -y && \
+    apt-get update && apt-get install -y --no-install-recommends \
+    python${PYTHON_VERSION} \
+    python${PYTHON_VERSION}-dev \
+    python${PYTHON_VERSION}-distutils \
+    && rm -rf /var/lib/apt/lists/*
 
-# Install user
-COPY ./common/install_user.sh install_user.sh
-RUN bash ./install_user.sh && rm install_user.sh
+# Set Python as default
+RUN update-alternatives --install /usr/bin/python python /usr/bin/python${PYTHON_VERSION} 100 && \
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYTHON_VERSION} 100
 
-# Install katex
-ARG KATEX
-COPY ./common/install_docs_reqs.sh install_docs_reqs.sh
-RUN bash ./install_docs_reqs.sh && rm install_docs_reqs.sh
+# Install pip
+RUN curl -sS https://bootstrap.pypa.io/get-pip.py | python${PYTHON_VERSION}
 
-# Install conda and other packages (e.g., numpy, pytest)
-ARG ANACONDA_PYTHON_VERSION
-ARG PYTHON_FREETHREADED
-ARG DOCS
-ENV ANACONDA_PYTHON_VERSION=$ANACONDA_PYTHON_VERSION
-ENV PYTHON_FREETHREADED=$PYTHON_FREETHREADED
-ENV PATH /opt/conda/envs/py_$ANACONDA_PYTHON_VERSION/bin:/opt/conda/bin:$PATH
-ENV DOCS=$DOCS
-COPY requirements-ci.txt requirements-docs.txt /opt/conda/
-COPY ./common/install_conda.sh install_conda.sh
-COPY ./common/common_utils.sh common_utils.sh
-COPY ./common/install_magma_conda.sh install_magma_conda.sh
-RUN bash ./install_conda.sh && rm install_conda.sh install_magma_conda.sh common_utils.sh /opt/conda/requirements-ci.txt /opt/conda/requirements-docs.txt
+# Upgrade pip and install common Python build dependencies
+RUN pip install --upgrade pip setuptools wheel && \
+    pip install \
+    numpy \
+    pyyaml \
+    typing_extensions \
+    requests \
+    six \
+    future \
+    hypothesis \
+    pytest \
+    pytest-xdist
 
-# Install gcc
-ARG GCC_VERSION
-COPY ./common/install_gcc.sh install_gcc.sh
-RUN bash ./install_gcc.sh && rm install_gcc.sh
+# Install newer CMake if needed
+RUN CMAKE_ARCH=$(uname -m) && \
+    wget -q "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-${CMAKE_ARCH}.sh" \
+        -O /tmp/cmake-install.sh && \
+    chmod +x /tmp/cmake-install.sh && \
+    /tmp/cmake-install.sh --skip-license --prefix=/usr/local && \
+    rm /tmp/cmake-install.sh
 
-# Install lcov for C++ code coverage
-COPY ./common/install_lcov.sh install_lcov.sh
-RUN  bash ./install_lcov.sh && rm install_lcov.sh
+# Set up working directory
+WORKDIR /workspace
 
-# Install cuda and cudnn
-ARG CUDA_VERSION
-COPY ./common/install_cuda.sh install_cuda.sh
-COPY ./common/install_nccl.sh install_nccl.sh
-COPY ./ci_commit_pins/nccl* /ci_commit_pins/
-COPY ./common/install_cusparselt.sh install_cusparselt.sh
-RUN bash ./install_cuda.sh ${CUDA_VERSION} && rm install_cuda.sh install_nccl.sh /ci_commit_pins/nccl* install_cusparselt.sh
-ENV DESIRED_CUDA ${CUDA_VERSION}
-ENV PATH /usr/local/nvidia/bin:/usr/local/cuda/bin:$PATH
-# No effect if cuda not installed
-ENV USE_SYSTEM_NCCL=1
-ENV NCCL_INCLUDE_DIR="/usr/local/cuda/include/"
-ENV NCCL_LIB_DIR="/usr/local/cuda/lib64/"
+# Copy and run common setup script if it exists
+COPY ./common /workspace/common
 
+# Environment variables for builds
+ENV PATH=/usr/local/bin:${PATH}
+ENV CC=/usr/bin/gcc
+ENV CXX=/usr/bin/g++
 
-ARG CUDA_VERSION
-
-ARG INDUCTOR_BENCHMARKS
-COPY ./common/install_inductor_benchmark_deps.sh install_inductor_benchmark_deps.sh
-COPY ./common/common_utils.sh common_utils.sh
-COPY ci_commit_pins/huggingface-requirements.txt huggingface-requirements.txt
-COPY ci_commit_pins/timm.txt timm.txt
-COPY ci_commit_pins/torchbench.txt torchbench.txt
-# Only build aoti cpp tests when INDUCTOR_BENCHMARKS is set to True
-ENV BUILD_AOT_INDUCTOR_TEST ${INDUCTOR_BENCHMARKS}
-RUN if [ -n "${INDUCTOR_BENCHMARKS}" ]; then bash ./install_inductor_benchmark_deps.sh; fi
-RUN rm install_inductor_benchmark_deps.sh common_utils.sh timm.txt huggingface-requirements.txt torchbench.txt
-
-ARG INSTALL_MINGW
-COPY ./common/install_mingw.sh install_mingw.sh
-RUN if [ -n "${INSTALL_MINGW}" ]; then bash ./install_mingw.sh; fi
-RUN rm install_mingw.sh
-
-ARG TRITON
-ARG TRITON_CPU
-
-# Create a separate stage for building Triton and Triton-CPU.  install_triton
-# will check for the presence of env vars
-FROM base as triton-builder
-COPY ./common/install_triton.sh install_triton.sh
-COPY ./common/common_utils.sh common_utils.sh
-COPY ci_commit_pins/triton.txt triton.txt
-COPY ci_commit_pins/triton-cpu.txt triton-cpu.txt
-RUN bash ./install_triton.sh
-
-FROM base as final
-COPY --from=triton-builder /opt/triton /opt/triton
-RUN if [ -n "${TRITON}" ] || [ -n "${TRITON_CPU}" ]; then pip install /opt/triton/*.whl; chown -R jenkins:jenkins /opt/conda; fi
-RUN rm -rf /opt/triton
-
-ARG EXECUTORCH
-# Build and install executorch
-COPY ./common/install_executorch.sh install_executorch.sh
-COPY ./common/common_utils.sh common_utils.sh
-COPY ci_commit_pins/executorch.txt executorch.txt
-RUN if [ -n "${EXECUTORCH}" ]; then bash ./install_executorch.sh; fi
-RUN rm install_executorch.sh common_utils.sh executorch.txt
-
-ARG HALIDE
-# Build and install halide
-COPY ./common/install_halide.sh install_halide.sh
-COPY ./common/common_utils.sh common_utils.sh
-COPY ci_commit_pins/halide.txt halide.txt
-RUN if [ -n "${HALIDE}" ]; then bash ./install_halide.sh; fi
-RUN rm install_halide.sh common_utils.sh halide.txt
-
-ARG PALLAS
-ARG TPU
-ARG CUDA_VERSION
-# Install JAX (for Pallas) - with TPU/CUDA support based on args
-# TPU=yes -> install JAX with TPU support
-# PALLAS=yes + CUDA_VERSION -> install JAX with CUDA support
-# PALLAS=yes (no CUDA) -> install JAX CPU-only
-COPY ./common/requirements_tpu.txt requirements_tpu.txt
-COPY ./common/install_jax.sh install_jax.sh
-COPY ./common/common_utils.sh common_utils.sh
-COPY ./ci_commit_pins/jax.txt /ci_commit_pins/jax.txt
-RUN if [ -n "${TPU}" ]; then \
-      bash -c "source ./common_utils.sh && pip_install -r requirements_tpu.txt" && \
-      bash ./install_jax.sh tpu; \
-    elif [ -n "${PALLAS}" ]; then \
-      bash ./install_jax.sh ${CUDA_VERSION:-cpu}; \
-    fi
-RUN rm -f install_jax.sh common_utils.sh /ci_commit_pins/jax.txt
-
-ARG ONNX
-# Install ONNX dependencies
-COPY ./common/install_onnx.sh ./common/common_utils.sh ./
-RUN if [ -n "${ONNX}" ]; then bash ./install_onnx.sh; fi
-RUN rm install_onnx.sh common_utils.sh
-
-# Build TSan-instrumented CPython for thread sanitizer testing
-ARG TSAN
-COPY ./common/install_cpython.sh install_cpython.sh
-COPY requirements-ci.txt /tmp/requirements-ci.txt
-RUN if [ -n "${TSAN}" ]; then \
-      CC=clang-18 CXX=clang++-18 \
-      CPYTHON_VERSIONS="3.14.4t+tsan" bash ./install_cpython.sh && \
-      /opt/python/cp314-cp314t+tsan/bin/pip install -r /tmp/requirements-ci.txt; \
-    fi
-RUN rm -f install_cpython.sh /tmp/requirements-ci.txt
-
-# (optional) Build ACL
-ARG ACL
-COPY ./common/install_acl.sh install_acl.sh
-RUN if [ -n "${ACL}" ]; then bash ./install_acl.sh; fi
-RUN rm install_acl.sh
-ENV INSTALLED_ACL ${ACL}
-
-ARG OPENBLAS
-COPY ./common/install_openblas.sh install_openblas.sh
-RUN if [ -n "${OPENBLAS}" ]; then bash ./install_openblas.sh; fi
-RUN rm install_openblas.sh
-ENV INSTALLED_OPENBLAS ${OPENBLAS}
-
-# Install ccache/sccache (do this last, so we get priority in PATH)
-ARG SKIP_SCCACHE_INSTALL
-COPY ./common/install_cache.sh install_cache.sh
-ENV PATH /opt/cache/bin:$PATH
-RUN if [ -z "${SKIP_SCCACHE_INSTALL}" ]; then bash ./install_cache.sh; fi
-RUN rm install_cache.sh
-
-# Add jni.h for java host build
-COPY ./common/install_jni.sh install_jni.sh
-COPY ./java/jni.h jni.h
-RUN bash ./install_jni.sh && rm install_jni.sh
-
-# Install Open MPI for CUDA
-COPY ./common/install_openmpi.sh install_openmpi.sh
-RUN if [ -n "${CUDA_VERSION}" ]; then bash install_openmpi.sh; fi
-RUN rm install_openmpi.sh
-
-# Include BUILD_ENVIRONMENT environment variable in image
-ARG BUILD_ENVIRONMENT
-ENV BUILD_ENVIRONMENT ${BUILD_ENVIRONMENT}
-
-# AWS specific CUDA build guidance
-ENV TORCH_NVCC_FLAGS "-Xfatbin -compress-all"
-ENV CUDA_PATH /usr/local/cuda
-
-USER jenkins
-CMD ["bash"]
+# Default command
+CMD ["/bin/bash"]
