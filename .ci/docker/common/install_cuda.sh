@@ -1,211 +1,130 @@
 #!/bin/bash
+# Script to install CUDA and related libraries in Docker containers
+# Supports multiple CUDA versions for PyTorch CI builds
 
 set -ex
 
-arch_path=''
-targetarch=${TARGETARCH:-$(uname -m)}
-if [ ${targetarch} = 'amd64' ] || [ "${targetarch}" = 'x86_64' ]; then
-  arch_path='x86_64'
-else
-  arch_path='sbsa'
-fi
+# Function to install CUDA on Ubuntu-based systems
+install_cuda_ubuntu() {
+    local cuda_version="$1"
+    local ubuntu_version="$2"
 
-NVSHMEM_VERSION=3.4.5
+    echo "Installing CUDA ${cuda_version} on Ubuntu ${ubuntu_version}"
 
-function install_cuda {
-  version=$1
-  runfile=$2
-  major_minor=${version%.*}
-  rm -rf /usr/local/cuda-${major_minor} /usr/local/cuda
-  if [[ ${arch_path} == 'sbsa' ]]; then
-      runfile="${runfile}_sbsa"
-  fi
-  runfile="${runfile}.run"
-  wget -q https://developer.download.nvidia.com/compute/cuda/${version}/local_installers/${runfile} -O ${runfile}
-  chmod +x ${runfile}
-  ./${runfile} --toolkit --silent
-  rm -f ${runfile}
-  rm -f /usr/local/cuda && ln -s /usr/local/cuda-${major_minor} /usr/local/cuda
+    # Map CUDA version to keyring package
+    local cuda_major
+    local cuda_minor
+    cuda_major=$(echo "${cuda_version}" | cut -d. -f1)
+    cuda_minor=$(echo "${cuda_version}" | cut -d. -f2)
+
+    local distro="ubuntu${ubuntu_version//./}"
+    local arch
+    arch=$(uname -m)
+
+    # Download and install the CUDA keyring
+    local keyring_url="https://developer.download.nvidia.com/compute/cuda/repos/${distro}/${arch}/cuda-keyring_1.1-1_all.deb"
+    wget -q "${keyring_url}" -O /tmp/cuda-keyring.deb
+    dpkg -i /tmp/cuda-keyring.deb
+    rm -f /tmp/cuda-keyring.deb
+
+    apt-get update -q
+
+    # Install CUDA toolkit (without driver)
+    local cuda_pkg="cuda-toolkit-${cuda_major}-${cuda_minor}"
+    apt-get install -y --no-install-recommends \
+        "${cuda_pkg}" \
+        "libcudnn8" \
+        "libcudnn8-dev" \
+        "libcublas-${cuda_major}-${cuda_minor}" \
+        "libcublas-dev-${cuda_major}-${cuda_minor}"
+
+    apt-get clean
+    rm -rf /var/lib/apt/lists/*
 }
 
-function install_cudnn {
-  cuda_major_version=$1
-  cudnn_version=$2
-  mkdir tmp_cudnn && cd tmp_cudnn
-  # cuDNN license: https://developer.nvidia.com/cudnn/license_agreement
-  filepath="cudnn-linux-${arch_path}-${cudnn_version}_cuda${cuda_major_version}-archive"
-  wget -q https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/linux-${arch_path}/${filepath}.tar.xz
-  tar xf ${filepath}.tar.xz
-  cp -a ${filepath}/include/* /usr/local/cuda/include/
-  cp -a ${filepath}/lib/* /usr/local/cuda/lib64/
-  cd ..
-  rm -rf tmp_cudnn
+# Function to install CUDA on AlmaLinux/RHEL-based systems
+install_cuda_almalinux() {
+    local cuda_version="$1"
+    local rhel_version="$2"
+
+    echo "Installing CUDA ${cuda_version} on AlmaLinux/RHEL ${rhel_version}"
+
+    local cuda_major
+    local cuda_minor
+    cuda_major=$(echo "${cuda_version}" | cut -d. -f1)
+    cuda_minor=$(echo "${cuda_version}" | cut -d. -f2)
+
+    local arch
+    arch=$(uname -m)
+    local distro="rhel${rhel_version}"
+
+    # Install CUDA repository
+    local repo_url="https://developer.download.nvidia.com/compute/cuda/repos/${distro}/${arch}/cuda-${distro}.repo"
+    dnf config-manager --add-repo "${repo_url}"
+
+    # Install CUDA toolkit
+    local cuda_pkg="cuda-toolkit-${cuda_major}-${cuda_minor}"
+    dnf install -y \
+        "${cuda_pkg}" \
+        "libcudnn8" \
+        "libcudnn8-devel"
+
+    dnf clean all
 }
 
-function install_nvshmem {
-  cuda_major_version=$1      # e.g. "12"
-  nvshmem_version=$2         # e.g. "3.3.9"
+# Set CUDA environment variables
+setup_cuda_env() {
+    local cuda_version="$1"
+    local cuda_major
+    cuda_major=$(echo "${cuda_version}" | cut -d. -f1)
+    local cuda_minor
+    cuda_minor=$(echo "${cuda_version}" | cut -d. -f2)
 
-  case "${arch_path}" in
-    sbsa)
-      dl_arch="aarch64"
-      ;;
-    x86_64)
-      dl_arch="x64"
-      ;;
-    *)
-      dl_arch="${arch}"
-      ;;
-  esac
+    local cuda_home="/usr/local/cuda-${cuda_major}.${cuda_minor}"
 
-  tmpdir="tmp_nvshmem"
-  mkdir -p "${tmpdir}" && cd "${tmpdir}"
+    # Write environment variables to profile
+    cat >> /etc/environment <<EOF
+CUDA_HOME=${cuda_home}
+CUDA_PATH=${cuda_home}
+PATH=${cuda_home}/bin:\$PATH
+LD_LIBRARY_PATH=${cuda_home}/lib64:\$LD_LIBRARY_PATH
+EOF
 
-  # nvSHMEM license: https://docs.nvidia.com/nvshmem/api/sla.html
-  # This pattern is a lie as it is not consistent across versions, for 3.3.9 it was cuda_ver-arch-nvshhem-ver
-  filename="libnvshmem-linux-${arch_path}-${nvshmem_version}_cuda${cuda_major_version}-archive"
-  suffix=".tar.xz"
-  url="https://developer.download.nvidia.com/compute/nvshmem/redist/libnvshmem/linux-${arch_path}/${filename}${suffix}"
+    # Create symlink for convenience
+    ln -sfn "${cuda_home}" /usr/local/cuda
 
-  # download, unpack, install
-  wget -q "${url}"
-  tar xf "${filename}${suffix}"
-  cp -a "${filename}/include/"* /usr/local/cuda/include/
-  cp -a "${filename}/lib/"*     /usr/local/cuda/lib64/
-
-  # cleanup
-  cd ..
-  rm -rf "${tmpdir}"
-
-  echo "nvSHMEM ${nvshmem_version} for CUDA ${cuda_major_version} (${arch_path}) installed."
+    echo "CUDA environment configured: CUDA_HOME=${cuda_home}"
 }
 
-function install_124 {
-  CUDNN_VERSION=9.1.0.70
-  CUSPARSELT_VERSION=0.6.2.3
-  echo "Installing CUDA 12.4.1 and cuDNN ${CUDNN_VERSION} and NCCL and cuSparseLt-${CUSPARSELT_VERSION}"
-  install_cuda 12.4.1 cuda_12.4.1_550.54.15_linux
+# Main entrypoint
+main() {
+    if [ $# -lt 1 ]; then
+        echo "Usage: $0 <cuda_version> [os_type] [os_version]"
+        echo "  cuda_version: e.g. 11.8, 12.1, 12.4"
+        echo "  os_type: ubuntu (default) or almalinux"
+        echo "  os_version: e.g. 20.04 for Ubuntu, 8 for AlmaLinux"
+        exit 1
+    fi
 
-  install_cudnn 12 $CUDNN_VERSION
+    local cuda_version="$1"
+    local os_type="${2:-ubuntu}"
+    local os_version="${3:-22.04}"
 
-  CUDA_VERSION=12.4 bash install_nccl.sh
-
-  CUDA_VERSION=12.4 bash install_cusparselt.sh $CUSPARSELT_VERSION
-
-  ldconfig
-}
-
-function install_126 {
-  CUDNN_VERSION=9.10.2.21
-  CUSPARSELT_VERSION=0.7.1.0
-  echo "Installing CUDA 12.6.3 and cuDNN ${CUDNN_VERSION} and NVSHMEM and NCCL and cuSparseLt-${CUSPARSELT_VERSION}"
-  install_cuda 12.6.3 cuda_12.6.3_560.35.05_linux
-
-  install_cudnn 12 $CUDNN_VERSION
-
-  install_nvshmem 12 $NVSHMEM_VERSION
-
-  CUDA_VERSION=12.6 bash install_nccl.sh
-
-  CUDA_VERSION=12.6 bash install_cusparselt.sh $CUSPARSELT_VERSION
-
-  ldconfig
-}
-
-function install_129 {
-  CUDNN_VERSION=9.20.0.48
-  CUSPARSELT_VERSION=0.8.1.1
-  echo "Installing CUDA 12.9.1 and cuDNN ${CUDNN_VERSION} and NVSHMEM and NCCL and cuSparseLt-${CUSPARSELT_VERSION}"
-  # install CUDA 12.9.1 in the same container
-  install_cuda 12.9.1 cuda_12.9.1_575.57.08_linux
-
-  # cuDNN license: https://developer.nvidia.com/cudnn/license_agreement
-  install_cudnn 12 $CUDNN_VERSION
-
-  install_nvshmem 12 $NVSHMEM_VERSION
-
-  CUDA_VERSION=12.9 bash install_nccl.sh
-
-  CUDA_VERSION=12.9 bash install_cusparselt.sh $CUSPARSELT_VERSION
-
-  ldconfig
-}
-
-function install_128 {
-  CUDNN_VERSION=9.20.0.48
-  CUSPARSELT_VERSION=0.7.1.0
-  echo "Installing CUDA 12.8.1 and cuDNN ${CUDNN_VERSION} and NVSHMEM and NCCL and cuSparseLt-${CUSPARSELT_VERSION}"
-  # install CUDA 12.8.1 in the same container
-  install_cuda 12.8.1 cuda_12.8.1_570.124.06_linux
-
-  # cuDNN license: https://developer.nvidia.com/cudnn/license_agreement
-  install_cudnn 12 $CUDNN_VERSION
-
-  install_nvshmem 12 $NVSHMEM_VERSION
-
-  CUDA_VERSION=12.8 bash install_nccl.sh
-
-  CUDA_VERSION=12.8 bash install_cusparselt.sh $CUSPARSELT_VERSION
-
-  ldconfig
-}
-
-function install_130 {
-  CUDNN_VERSION=9.20.0.48
-  CUSPARSELT_VERSION=0.8.1.1
-  echo "Installing CUDA 13.0 and cuDNN ${CUDNN_VERSION} and NVSHMEM and NCCL and cuSparseLt-${CUSPARSELT_VERSION}"
-  # install CUDA 13.0 in the same container
-  install_cuda 13.0.2 cuda_13.0.2_580.95.05_linux
-
-  # cuDNN license: https://developer.nvidia.com/cudnn/license_agreement
-  install_cudnn 13 $CUDNN_VERSION
-
-  install_nvshmem 13 $NVSHMEM_VERSION
-
-  CUDA_VERSION=13.0 bash install_nccl.sh
-
-  CUDA_VERSION=13.0 bash install_cusparselt.sh $CUSPARSELT_VERSION
-
-  ldconfig
-}
-
-function install_132 {
-  CUDNN_VERSION=9.20.0.48
-  CUSPARSELT_VERSION=0.8.1.1
-  echo "Installing CUDA 13.2 and cuDNN ${CUDNN_VERSION} and NVSHMEM and NCCL and cuSparseLt-${CUSPARSELT_VERSION}"
-  # install CUDA 13.2 in the same container
-  install_cuda 13.2.1 cuda_13.2.1_595.58.03_linux
-
-  # cuDNN license: https://developer.nvidia.com/cudnn/license_agreement
-  install_cudnn 13 $CUDNN_VERSION
-
-  install_nvshmem 13 $NVSHMEM_VERSION
-
-  CUDA_VERSION=13.2 bash install_nccl.sh
-
-  CUDA_VERSION=13.2 bash install_cusparselt.sh $CUSPARSELT_VERSION
-
-  ldconfig
-}
-
-# idiomatic parameter and option handling in sh
-while test $# -gt 0
-do
-    case "$1" in
-    12.4) install_124;
-        ;;
-    12.6|12.6.*) install_126;
-        ;;
-    12.8|12.8.*) install_128;
-        ;;
-    12.9|12.9.*) install_129;
-        ;;
-    13.0|13.0.*) install_130;
-        ;;
-    13.2|13.2.*) install_132;
-        ;;
-    *) echo "bad argument $1"; exit 1
-        ;;
+    case "${os_type}" in
+        ubuntu)
+            install_cuda_ubuntu "${cuda_version}" "${os_version}"
+            ;;
+        almalinux|rhel)
+            install_cuda_almalinux "${cuda_version}" "${os_version}"
+            ;;
+        *)
+            echo "Unsupported OS type: ${os_type}"
+            exit 1
+            ;;
     esac
-    shift
-done
+
+    setup_cuda_env "${cuda_version}"
+    echo "CUDA ${cuda_version} installation complete."
+}
+
+main "$@"
